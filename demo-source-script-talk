@@ -1,0 +1,189 @@
+#!/bin/bash
+
+# On this host Docker 1.12 is installed and that version does not allow flags -d && --rm
+# additionally we have to redirect docker logs to journald on that machine
+if [ $(hostname) == "acslocaldev" ]
+then
+  DOCKER_1_13_OPTION="--log-driver journald"
+else
+  DOCKER_1_13_OPTION="--rm"
+fi
+
+alias dk='CONTAINER=$(docker ps -qa) && docker kill $CONTAINER || true && docker rm $CONTAINER'
+alias dk-openshift='oc scale dc acs-server-deployment --replicas=0 && oc scale dc router --replicas=0 && CONTAINER=$(docker ps -qa) && docker kill $CONTAINER || true && docker rm $CONTAINER'
+alias drm='docker rm -f  $(docker ps -q)'
+alias dps='docker ps'
+de () { docker exec -it "$@" bash; }
+# not using docker logs as limited output is not possible : here 1000 lines
+dl () { sudo tail -1000f `docker inspect -f '{{ .LogPath }}' "$@"`; }
+ 
+function setup-linux-host() {
+  sudo yum install -y dstat
+  sudo yum install -y java-1.8.0-openjdk-devel
+  sudo yum install -y docker
+  sudo yum install -y stress
+}
+
+function run-dstat() {
+  echo "Executing : dstat -m 10 50000"
+  dstat -m 20 50
+}
+
+function run-1-chaos-monkey-mem-consumer-app() {
+  MEM_TO_BE_TAKEN_IN_KB=$(awk '/MemAvailable/{printf "%d\n", $2 * 0.95;}' < /proc/meminfo)
+  stress --vm-bytes ${MEM_TO_BE_TAKEN_IN_KB}k --vm-keep -m 1
+  # making it high priority in OOM killer's eyes : sudo bash -c "echo '-17' | tee /proc/$PID/oom_adj"
+}
+
+function run-1-openjdk8-fat-jar-no-limits-best-effort() {
+  NAME_SUFFIX=${1:-1}
+  JAVA_OPTS="-XshowSettings:vm"
+  REPO=`pwd`
+  set -x
+  # oom-score-adj to fake to have a "best effort" QualityOfService Kubernetes container
+  ID=$(docker run -d ${DOCKER_1_13_OPTION} --name=${FUNCNAME[0]}${NAME_SUFFIX} --oom-score-adj=1000 \
+  -v ${REPO}/java-application-server-fat-jar/fatjar:/deployments docker.io/openjdk:8-jdk \
+  java -jar ${JAVA_OPTS} /deployments/BananaServer.jar)
+  set +x
+  sleep 5
+  docker logs ${ID}
+  curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}${NAME_SUFFIX}`:8080/
+  set +x
+  echo "---"
+  echo "To stress container : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}${NAME_SUFFIX}`:8080/ram"
+  echo "    or : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}${NAME_SUFFIX}`:8080/cpu-100"
+  echo "    or : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}${NAME_SUFFIX}`:8080/deflater-10"
+  echo "Then check logs : sudo journalctl -n 50 -f"
+}
+
+function run-2-openjdk8-fat-jar-with-container-limits-500M-2cores() {
+  REPO=`pwd`
+  JAVA_OPTS="-XshowSettings:vm"
+  # oom-score-adj used to fake to have a "guaranteed" QualityOfService Kubernetes container
+  set -x
+  ID=$(docker run -d ${DOCKER_1_13_OPTION} --name=${FUNCNAME[0]} \
+  --cpu-shares=2048 --memory=500MB --oom-score-adj=0 \
+  -v ${REPO}/java-application-server-fat-jar/fatjar:/deployments docker.io/openjdk:8-jdk \
+  java -jar ${JAVA_OPTS} /deployments/BananaServer.jar)
+  set +x
+  sleep 5
+  docker logs ${ID}
+  curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/
+  set +x
+  echo "To stress container : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/ram"
+  echo "    or : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/cpu-100"
+  echo "    or : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/deflater-10"
+  echo "Then check logs : sudo journalctl -n 50 -f"
+}
+
+function run-3-openjdk8_redhat-fat-jar-with-container-limits-500M-2cores() {
+  echo " Run Red Hat JDK 8 - with JAVA_OPTS_APPEND"
+  REPO=`pwd`
+  JAVA_OPTS="-XshowSettings:vm -Djava.security.egd=file:/dev/./urandom"
+  set -x
+  ID=$(docker run -d ${DOCKER_1_13_OPTION} --name=${FUNCNAME[0]} --cpu-shares=2048 --memory=500MB \
+  -e "JAVA_OPTIONS=${JAVA_OPTS}" \
+  -e "JAVA_MAX_MEM_RATIO=60" \
+  -v ${REPO}/java-application-server-fat-jar/fatjar:/deployments registry.access.redhat.com/redhat-openjdk-18/openjdk18-openshift:1.3-7)
+  set +x
+  sleep 5
+  docker logs ${ID}
+  curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/
+  set +x
+  echo "To stress container : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/ram"
+  echo "    or : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/cpu-100"
+  echo "    or : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/deflater-10"
+  echo "Then check logs : sudo journalctl -n 50 -f"
+}
+
+function run-4-openjdk11-fat-jar-with-container-limits-500M-2cores() {
+  echo " Run OpenJDK JDK 11"
+  JAVA_OPTS="-XX:MaxRAMPercentage=60 -XshowSettings:vm"
+  REPO=`pwd`
+  set -x
+  ID=$(docker run -d ${DOCKER_1_13_OPTION} --name=${FUNCNAME[0]} --cpu-shares=2048 --memory=500MB \
+  -v ${REPO}/java-application-server-fat-jar/fatjar:/deployments docker.io/openjdk:11-jdk \
+  java -jar ${JAVA_OPTS} /deployments/BananaServer.jar)
+  set +x
+  sleep 5
+  docker logs ${ID}
+  curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/
+  set +x
+  echo "To stress container : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/ram"
+  echo "    or : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/cpu-100"
+  echo "    or : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/deflater-10"
+  echo "Then check logs : sudo journalctl -n 50 -f"  
+}
+
+function run-0-openjdk11-fat-jar-showing-jcmd() {
+  echo " Run OpenJDK JDK 11"
+  JAVA_OPTS="-XX:MaxRAMPercentage=60 -XshowSettings:vm -XX:+UnlockDiagnosticVMOptions -XX:NativeMemoryTracking=detail -XX:+LogTouchedMethods -XX:+UnlockExperimentalVMOptions "
+  REPO=`pwd`
+  set -x
+  ID=$(docker run -d ${DOCKER_1_13_OPTION} --name=${FUNCNAME[0]} --cpu-shares=2048 --memory=500MB \
+  -v ${REPO}/java-application-server-fat-jar/fatjar:/deployments docker.io/openjdk:11-jdk \
+  java -jar ${JAVA_OPTS} /deployments/BananaServer.jar)
+  set +x
+  sleep 5
+  docker logs ${ID}
+  curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/
+  set +x
+  echo "To stress container : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/ram"
+  echo "    or : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/cpu-100"
+  echo "    or : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/deflater-10"
+  echo "Then check logs : sudo journalctl -n 50 -f"  
+}
+
+function run-openjdk8_redhat-bash() {
+  echo " Run Red Hat JDK"
+  set -x
+  docker run -it ${DOCKER_1_13_OPTION} --cpu-shares=2048 --memory=1000MB --memory-swappiness=-1 --memory=1200MB \
+  registry.access.redhat.com/redhat-openjdk-18/openjdk18-openshift:1.3-7 bash
+  set +x
+}
+
+function run-openjdk-8-versionprint-and-jvm-options() {
+  echo "Run OpenJDK 8"
+  set -x
+  JAVA_OPTS="-XX:+PrintFlagsFinal -XshowSettings:vm"
+  docker run -it ${DOCKER_1_13_OPTION} --cpu-shares=2048 --memory-reservation=400MB --memory=400MB docker.io/openjdk:8-jdk \
+  java ${JAVA_OPTS} -version
+  set +x
+}
+
+function run-openjdk-11-versionprint-and-jvm-options() {
+  echo "Run OpenJDK 11"
+  set -x
+  JAVA_OPTS="-XX:+PrintFlagsFinal -XX:+UnlockDiagnosticVMOptions -Xss228K -XX:+UnlockExperimentalVMOptions -XshowSettings:vm"
+  docker run -it ${DOCKER_1_13_OPTION} --cpu-shares=2048 --memory-reservation=400MB --memory=400MB docker.io/openjdk:11-jdk \
+  java ${JAVA_OPTS} -XX:MaxRAMPercentage=80 -version
+  set +x
+}
+
+function run-openjdk11-jshell() {
+  echo "Run OpenJDK 11"
+  set -x
+  docker run -it ${DOCKER_1_13_OPTION} --cpu-shares=2048 --memory=1000MB --memory-swappiness=-1 --memory=1200MB \
+  docker.io/openjdk:11-jdk bash -c "echo 'Runtime.getRuntime().availableProcessors()' | jshell -q"
+  set +x
+  echo "It returns 2 which is expected. But Runtime.getRuntime().availableProcessors() in a java jar does not work"
+}
+
+function run-openjdk11-fat-jar-with-container-limits-500M-2cores-AND-MaxDirectMemorySize() {
+  echo " Run OpenJDK JDK 11"
+  JAVA_OPTS="-XX:MaxRAMPercentage=60 -XshowSettings:vm -XX:MaxDirectMemorySize=20 -XX:+PrintFlagsFinal"
+  REPO=`pwd`
+  set -x
+  ID=$(docker run -d ${DOCKER_1_13_OPTION} --name=${FUNCNAME[0]} --cpu-shares=2048 --memory=500MB \
+  -v ${REPO}/java-application-server-fat-jar/fatjar:/deployments docker.io/openjdk:11-jdk \
+  java -jar ${JAVA_OPTS} /deployments/BananaServer.jar)
+  set +x
+  sleep 5
+  docker logs ${ID}
+  curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/
+  set +x
+  echo "To stress container : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/ram"
+  echo "    or : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/cpu-100"
+  echo "    or : curl `docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ${FUNCNAME[0]}`:8080/deflater-10"
+  echo "Then check logs : sudo journalctl -n 50 -f"  
+}

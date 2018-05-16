@@ -1,0 +1,3 @@
+Manifest-Version: 1.0
+Class-Path: .
+Main-Class: fr.rivieradev._2018._338.BananaServer
