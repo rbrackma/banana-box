@@ -2,7 +2,8 @@
 
 - Slides for the 50 min talk [click here](talk.pdf "Banana box principle talk Rivieradev.fr 2018")
 
-![Screenshot of the talk](talk-welcome-slide.jpg?raw=true)
+![Scretch notes of the talk](talk-scretch-notes.jpg?raw=true) ![Screenshot of the talk](talk-welcome-slide.jpg?raw=true)
+© skretch notes [https://github.com/corinnekrych](https://github.com/corinnekrych)
 
 - This repository was used to accompany the talk with a demo for the developer conference session : [2018.rivieradev.fr/session/338](2018.rivieradev.fr/session/338) (NCE, France)
 
